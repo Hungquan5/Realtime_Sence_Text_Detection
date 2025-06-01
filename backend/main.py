@@ -121,16 +121,51 @@ class OptimizedOCRProcessor:
         return image
     
     def _preprocess_image(self, image: np.ndarray) -> np.ndarray:
-        """Optimized image preprocessing"""
-        # Resize if needed
-        image = self._resize_image_if_needed(image)
-        
-        # Convert to RGB if needed (PaddleOCR expects RGB)
-        if len(image.shape) == 3 and image.shape[2] == 3:
-            # Assuming input is BGR from OpenCV, convert to RGB
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        
-        return image
+        """Optimized image preprocessing with validation"""
+        try:
+            # Validate input image
+            if image is None or image.size == 0:
+                raise ValueError("Invalid image: empty or None")
+            
+            if len(image.shape) not in [2, 3]:
+                raise ValueError(f"Invalid image shape: {image.shape}")
+            
+            # Ensure image has valid dimensions
+            height, width = image.shape[:2]
+            if height < 10 or width < 10:
+                raise ValueError(f"Image too small: {width}x{height}")
+            
+            if height > 10000 or width > 10000:
+                raise ValueError(f"Image too large: {width}x{height}")
+            
+            # Convert grayscale to RGB if needed
+            if len(image.shape) == 2:
+                image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+            elif len(image.shape) == 3 and image.shape[2] == 4:
+                # RGBA to RGB
+                image = cv2.cvtColor(image, cv2.COLOR_RGBA2RGB)
+            elif len(image.shape) == 3 and image.shape[2] == 3:
+                # Keep as RGB (already in correct format from PIL)
+                pass
+            else:
+                raise ValueError(f"Unsupported image format: {image.shape}")
+            
+            # Resize if needed
+            image = self._resize_image_if_needed(image)
+            
+            # Ensure contiguous array for PaddleOCR
+            if not image.flags['C_CONTIGUOUS']:
+                image = np.ascontiguousarray(image)
+            
+            # Ensure correct data type
+            if image.dtype != np.uint8:
+                image = image.astype(np.uint8)
+            
+            return image
+            
+        except Exception as e:
+            logger.error(f"Error in image preprocessing: {str(e)}")
+            raise ValueError(f"Image preprocessing failed: {str(e)}")
     
     @lru_cache(maxsize=128)
     def _get_image_hash(self, image_bytes: bytes) -> str:
@@ -181,50 +216,111 @@ class OptimizedOCRProcessor:
         return all_boxes, all_texts, all_confidences
     
     def process_image(self, image_array: np.ndarray, conf_threshold: float = 0.5):
-        """Optimized image processing with caching and preprocessing"""
+        """Optimized image processing with comprehensive error handling"""
         start_time = time.time()
         
         try:
+            # Validate input
+            if image_array is None:
+                raise ValueError("Input image is None")
+            
+            if not isinstance(image_array, np.ndarray):
+                raise ValueError(f"Input must be numpy array, got {type(image_array)}")
+            
+            logger.debug(f"Processing image with shape: {image_array.shape}, dtype: {image_array.dtype}")
+            
             # Preprocess image for optimal OCR performance
-            processed_image = self._preprocess_image(image_array)
+            try:
+                processed_image = self._preprocess_image(image_array)
+                logger.debug(f"Preprocessed image shape: {processed_image.shape}")
+            except Exception as e:
+                logger.error(f"Preprocessing failed: {str(e)}")
+                raise ValueError(f"Image preprocessing failed: {str(e)}")
             
-            # Run OCR detection
-            ocr_result_list = self.ocr.predict(processed_image)
-            all_boxes, all_texts, all_confidences = self.parse_ocr_results(ocr_result_list)
-            
-            # Vectorized confidence filtering
-            conf_mask = np.array(all_confidences) >= conf_threshold
-            
-            detections = []
-            if conf_mask.any():
-                valid_indices = np.where(conf_mask)[0]
+            # Run OCR detection with error handling
+            try:
+                # Create a copy to ensure memory safety
+                ocr_input = processed_image.copy()
                 
-                for i in valid_indices:
-                    # Scale boxes back if image was resized
-                    box = all_boxes[i]
-                    original_height, original_width = image_array.shape[:2]
-                    processed_height, processed_width = processed_image.shape[:2]
-                    
-                    if (original_height != processed_height) or (original_width != processed_width):
-                        scale_x = original_width / processed_width
-                        scale_y = original_height / processed_height
-                        box = [[int(point[0] * scale_x), int(point[1] * scale_y)] for point in box]
+                # Run OCR with timeout protection
+                ocr_result_list = self.ocr.predict(ocr_input)
+                
+                if ocr_result_list is None:
+                    logger.warning("OCR returned None result")
+                    return [], time.time() - start_time
+                
+            except Exception as e:
+                logger.error(f"OCR processing failed: {str(e)}")
+                # Try with a smaller image if OCR fails
+                try:
+                    height, width = processed_image.shape[:2]
+                    if max(height, width) > 640:
+                        scale = 640 / max(height, width)
+                        new_width = int(width * scale)
+                        new_height = int(height * scale)
+                        smaller_image = cv2.resize(processed_image, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
+                        ocr_result_list = self.ocr.ocr(smaller_image)
+                        logger.info("Successfully processed with smaller image")
                     else:
-                        box = [[int(point[0]), int(point[1])] for point in box]
+                        raise e
+                except Exception as retry_error:
+                    logger.error(f"Retry with smaller image also failed: {str(retry_error)}")
+                    return [], time.time() - start_time
+            
+            # Parse results with error handling
+            try:
+                all_boxes, all_texts, all_confidences = self.parse_ocr_results(ocr_result_list)
+            except Exception as e:
+                logger.error(f"Result parsing failed: {str(e)}")
+                return [], time.time() - start_time
+            
+            # Filter results by confidence
+            detections = []
+            if all_confidences:
+                try:
+                    # Vectorized confidence filtering
+                    conf_mask = np.array(all_confidences) >= conf_threshold
                     
-                    detection = {
-                        'text': all_texts[i],
-                        'confidence': float(all_confidences[i]),
-                        'box': box
-                    }
-                    detections.append(detection)
+                    if conf_mask.any():
+                        valid_indices = np.where(conf_mask)[0]
+                        
+                        for i in valid_indices:
+                            try:
+                                # Scale boxes back if image was resized
+                                box = all_boxes[i]
+                                original_height, original_width = image_array.shape[:2]
+                                processed_height, processed_width = processed_image.shape[:2]
+                                
+                                if (original_height != processed_height) or (original_width != processed_width):
+                                    scale_x = original_width / processed_width
+                                    scale_y = original_height / processed_height
+                                    box = [[int(point[0] * scale_x), int(point[1] * scale_y)] for point in box]
+                                else:
+                                    box = [[int(point[0]), int(point[1])] for point in box]
+                                
+                                detection = {
+                                    'text': all_texts[i],
+                                    'confidence': float(all_confidences[i]),
+                                    'box': box
+                                }
+                                detections.append(detection)
+                                
+                            except Exception as e:
+                                logger.warning(f"Error processing detection {i}: {str(e)}")
+                                continue
+                                
+                except Exception as e:
+                    logger.error(f"Error in confidence filtering: {str(e)}")
             
             processing_time = time.time() - start_time
+            logger.debug(f"Processing completed in {processing_time:.3f}s, found {len(detections)} detections")
             return detections, processing_time
             
         except Exception as e:
-            logger.error(f"Error processing image: {str(e)}")
-            raise
+            processing_time = time.time() - start_time
+            logger.error(f"Critical error processing image: {str(e)}")
+            # Return empty results instead of raising exception
+            return [], processing_time
 
 class FrameBuffer:
     """Circular buffer for managing frames to prevent memory buildup"""
@@ -298,23 +394,73 @@ async def process_image_async(image_array: np.ndarray, conf_threshold: float = 0
     )
 
 def decode_and_convert_image(base64_string: str) -> np.ndarray:
-    """Optimized image decoding and conversion"""
-    # Remove data URL prefix if present
-    if base64_string.startswith('data:image'):
-        base64_string = base64_string.split(',')[1]
+    """Optimized image decoding and conversion with robust error handling"""
+    try:
+        # Remove data URL prefix if present
+        if base64_string.startswith('data:image'):
+            base64_string = base64_string.split(',')[1]
+        
+        # Validate base64 string
+        if not base64_string or len(base64_string) < 10:
+            raise ValueError("Invalid or empty base64 string")
+        
+        # Decode base64 with error handling
+        try:
+            image_bytes = base64.b64decode(base64_string, validate=True)
+        except Exception as e:
+            raise ValueError(f"Invalid base64 encoding: {str(e)}")
+        
+        if len(image_bytes) < 100:  # Minimum reasonable image size
+            raise ValueError("Decoded image data too small")
+        
+        # Convert to PIL Image with error handling
+        try:
+            pil_image = Image.open(io.BytesIO(image_bytes))
+            
+            # Validate image
+            if pil_image.width < 10 or pil_image.height < 10:
+                raise ValueError(f"Image too small: {pil_image.width}x{pil_image.height}")
+            
+            if pil_image.width > 10000 or pil_image.height > 10000:
+                raise ValueError(f"Image too large: {pil_image.width}x{pil_image.height}")
+            
+            # Convert to RGB
+            if pil_image.mode not in ['RGB', 'L']:
+                pil_image = pil_image.convert('RGB')
+            elif pil_image.mode == 'L':
+                pil_image = pil_image.convert('RGB')  # Convert grayscale to RGB
+            
+        except Exception as e:
+            raise ValueError(f"Failed to process image: {str(e)}")
+        
+        # Convert to numpy array safely
+        try:
+            opencv_image = np.array(pil_image)
+            
+            # Ensure array is valid
+            if opencv_image.size == 0:
+                raise ValueError("Converted image array is empty")
+            
+            # Ensure correct shape and data type
+            if len(opencv_image.shape) == 2:
+                # Grayscale, convert to RGB
+                opencv_image = cv2.cvtColor(opencv_image, cv2.COLOR_GRAY2RGB)
+            elif len(opencv_image.shape) == 3 and opencv_image.shape[2] == 4:
+                # RGBA, convert to RGB
+                opencv_image = cv2.cvtColor(opencv_image, cv2.COLOR_RGBA2RGB)
+            
+            # Ensure uint8 data type
+            if opencv_image.dtype != np.uint8:
+                opencv_image = opencv_image.astype(np.uint8)
+            
+            return opencv_image
+            
+        except Exception as e:
+            raise ValueError(f"Failed to convert image to array: {str(e)}")
     
-    # Decode base64
-    image_bytes = base64.b64decode(base64_string)
-    
-    # Use faster PIL to OpenCV conversion
-    pil_image = Image.open(io.BytesIO(image_bytes))
-    if pil_image.mode != 'RGB':
-        pil_image = pil_image.convert('RGB')
-    
-    # Convert to numpy array (RGB format)
-    opencv_image = np.array(pil_image)
-    
-    return opencv_image
+    except Exception as e:
+        logger.error(f"Error in decode_and_convert_image: {str(e)}")
+        raise
 
 @app.post("/detect/image", response_model=TextDetectionResponse)
 async def detect_text_from_image(
@@ -532,9 +678,10 @@ async def process_stream_frames(stream_id: str):
             await asyncio.sleep(0.1)
 
 async def process_single_frame(stream_id: str, message: Dict):
-    """Process a single frame from the stream with optimizations"""
+    """Process a single frame from the stream with comprehensive error handling"""
     try:
         if stream_id not in active_websockets:
+            logger.warning(f"Stream {stream_id} not found in active websockets")
             return
         
         websocket_info = active_websockets[stream_id]
@@ -546,36 +693,89 @@ async def process_single_frame(stream_id: str, message: Dict):
         frame_data = message.get("frame", {})
         base64_image = frame_data.get("image")
         client_timestamp = frame_data.get("timestamp", time.time())
-        frame_id = frame_data.get("frame_id")
+        frame_id = frame_data.get("frame_id", str(uuid.uuid4()))
         
         if not base64_image:
             await websocket.send_json({
                 "type": "error",
-                "message": "Missing image data in frame"
+                "message": "Missing image data in frame",
+                "frame_id": frame_id
             })
             return
         
-        # Process the frame asynchronously
+        # Process the frame asynchronously with comprehensive error handling
         start_time = time.time()
         
-        # Decode and convert image in thread pool
-        loop = asyncio.get_event_loop()
-        opencv_image = await loop.run_in_executor(
-            THREAD_POOL,
-            decode_and_convert_image,
-            base64_image
-        )
+        try:
+            # Decode and convert image in thread pool with timeout
+            loop = asyncio.get_event_loop()
+            
+            # Set a timeout for image decoding
+            opencv_image = await asyncio.wait_for(
+                loop.run_in_executor(
+                    THREAD_POOL,
+                    decode_and_convert_image,
+                    base64_image
+                ),
+                timeout=5.0  # 5 second timeout
+            )
+            
+            logger.debug(f"Frame {frame_id}: Decoded image shape {opencv_image.shape}")
+            
+        except asyncio.TimeoutError:
+            logger.error(f"Frame {frame_id}: Image decoding timeout")
+            await websocket.send_json({
+                "type": "error",
+                "message": "Image decoding timeout",
+                "frame_id": frame_id
+            })
+            return
+        except Exception as e:
+            logger.error(f"Frame {frame_id}: Image decoding failed: {str(e)}")
+            await websocket.send_json({
+                "type": "error",
+                "message": f"Image decoding failed: {str(e)}",
+                "frame_id": frame_id
+            })
+            return
         
-        # Run OCR detection asynchronously
-        detections, processing_time = await process_image_async(
-            opencv_image, config.conf_threshold
-        )
+        try:
+            # Run OCR detection asynchronously with timeout
+            detections, processing_time = await asyncio.wait_for(
+                process_image_async(opencv_image, config.conf_threshold),
+                timeout=10.0  # 10 second timeout for OCR
+            )
+            
+            logger.debug(f"Frame {frame_id}: OCR completed, found {len(detections)} detections")
+            
+        except asyncio.TimeoutError:
+            logger.error(f"Frame {frame_id}: OCR processing timeout")
+            await websocket.send_json({
+                "type": "error",
+                "message": "OCR processing timeout",
+                "frame_id": frame_id
+            })
+            return
+        except Exception as e:
+            logger.error(f"Frame {frame_id}: OCR processing failed: {str(e)}")
+            # Send partial result with error
+            await websocket.send_json({
+                "type": "error",
+                "message": f"OCR processing failed: {str(e)}",
+                "frame_id": frame_id,
+                "processing_time": time.time() - start_time
+            })
+            return
         
         # Update stats
         stats["frames_processed"] += 1
         stats["total_detections"] += len(detections)
         stats["total_processing_time"] += processing_time
         stats["frames_dropped"] = websocket_info["frame_buffer"].dropped_frames
+        
+        # Calculate additional metrics
+        total_time = time.time() - start_time
+        stream_duration = time.time() - stats["start_time"]
         
         # Send results back to frontend
         result = {
@@ -585,31 +785,38 @@ async def process_single_frame(stream_id: str, message: Dict):
             "client_timestamp": client_timestamp,
             "server_timestamp": time.time(),
             "processing_time": processing_time,
+            "total_time": total_time,
             "detections": detections,
             "frame_info": {
                 "width": opencv_image.shape[1],
-                "height": opencv_image.shape[0]
+                "height": opencv_image.shape[0],
+                "channels": opencv_image.shape[2] if len(opencv_image.shape) > 2 else 1
             },
             "stats": {
                 "frames_processed": stats["frames_processed"],
                 "frames_dropped": stats["frames_dropped"],
                 "total_detections": stats["total_detections"],
                 "avg_processing_time": stats["total_processing_time"] / max(stats["frames_processed"], 1),
-                "stream_duration": time.time() - stats["start_time"],
-                "fps": stats["frames_processed"] / max(time.time() - stats["start_time"], 1)
+                "stream_duration": stream_duration,
+                "fps": stats["frames_processed"] / max(stream_duration, 1)
             }
         }
         
         await websocket.send_json(result)
+        logger.debug(f"Frame {frame_id}: Results sent successfully")
         
     except Exception as e:
-        logger.error(f"Error processing frame for stream {stream_id}: {e}")
+        logger.error(f"Critical error processing frame for stream {stream_id}: {str(e)}")
         if stream_id in active_websockets:
-            websocket = active_websockets[stream_id]["websocket"]
-            await websocket.send_json({
-                "type": "error",
-                "message": f"Frame processing error: {str(e)}"
-            })
+            try:
+                websocket = active_websockets[stream_id]["websocket"]
+                await websocket.send_json({
+                    "type": "critical_error",
+                    "message": f"Critical frame processing error: {str(e)}",
+                    "frame_id": frame_data.get("frame_id") if 'frame_data' in locals() else "unknown"
+                })
+            except Exception as send_error:
+                logger.error(f"Failed to send error message: {str(send_error)}")
 
 @app.get("/streams")
 async def list_active_streams():
