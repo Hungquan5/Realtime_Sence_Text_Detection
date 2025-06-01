@@ -1,19 +1,16 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
+from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
-import cv2
 import time
 import numpy as np
 import base64
 import io
 import json
-from pathlib import Path
-import tempfile
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
 import uuid
+import logging
 
 try:
     from paddleocr import PaddleOCR
@@ -23,7 +20,7 @@ except ImportError as e:
     ) from e
 
 from PIL import Image
-import logging
+import cv2
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -32,8 +29,8 @@ logger = logging.getLogger(__name__)
 # FastAPI app
 app = FastAPI(
     title="Scene Text Detection API",
-    description="Real-time scene text detection using PaddleOCR",
-    version="1.0.0"
+    description="Real-time scene text detection using PaddleOCR - receives frames from frontend",
+    version="2.0.0"
 )
 
 # Add CORS middleware
@@ -46,8 +43,7 @@ app.add_middleware(
 )
 
 # Global variables for streaming
-active_streams: Dict[str, Any] = {}
-executor = ThreadPoolExecutor(max_workers=4)
+active_websockets: Dict[str, Dict] = {}
 
 class TextDetectionResponse(BaseModel):
     success: bool
@@ -56,13 +52,15 @@ class TextDetectionResponse(BaseModel):
     processing_time: float
     image_info: Optional[Dict[str, Any]] = None
 
+class StreamFrame(BaseModel):
+    image: str  # base64 encoded image
+    timestamp: float
+    frame_id: Optional[str] = None
+
 class StreamConfig(BaseModel):
-    camera_index: int = 0
     lang: str = "en"
     use_gpu: bool = False
-    detection_interval: int = 5
     conf_threshold: float = 0.6
-    cv_font_scale: float = 0.5
 
 class OCRProcessor:
     """Wrapper class for PaddleOCR processing"""
@@ -89,9 +87,9 @@ class OCRProcessor:
             boxes = ocr_data.get('rec_polys') or ocr_data.get('dt_polys', [])
 
             valid_indices = [
-    i for i, (t, s, b) in enumerate(zip(texts, scores, boxes))
-    if t and s is not None and b is not None and len(b) > 0
-]
+                i for i, (t, s, b) in enumerate(zip(texts, scores, boxes))
+                if t and s is not None and b is not None and len(b) > 0
+            ]
 
             all_texts = [texts[i] for i in valid_indices]
             all_confidences = [float(scores[i]) for i in valid_indices]
@@ -115,7 +113,7 @@ class OCRProcessor:
         start_time = time.time()
         
         try:
-            ocr_result_list = self.ocr.predict(image_array)
+            ocr_result_list = self.ocr.ocr(image_array)
             all_boxes, all_texts, all_confidences = self.parse_ocr_results(ocr_result_list)
             
             detections = []
@@ -141,7 +139,7 @@ ocr_processor = OCRProcessor()
 @app.get("/")
 async def root():
     """Health check endpoint"""
-    return {"message": "Scene Text Detection API is running"}
+    return {"message": "Scene Text Detection API - Frontend streams frames to backend"}
 
 @app.get("/health")
 async def health_check():
@@ -150,7 +148,9 @@ async def health_check():
         "status": "healthy",
         "timestamp": time.time(),
         "ocr_lang": ocr_processor.lang,
-        "gpu_enabled": ocr_processor.use_gpu
+        "gpu_enabled": ocr_processor.use_gpu,
+        "active_websockets": len(active_websockets),
+        "description": "Backend processes frames received from frontend"
     }
 
 @app.post("/detect/image", response_model=TextDetectionResponse)
@@ -254,155 +254,216 @@ async def detect_text_from_base64(
         logger.error(f"Error in detect_text_from_base64: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
 
-@app.post("/stream/start")
-async def start_stream(config: StreamConfig):
-    """Start a new video stream for text detection"""
+@app.websocket("/ws/stream/{stream_id}")
+async def websocket_stream_endpoint(websocket: WebSocket, stream_id: str):
+    """WebSocket endpoint for real-time frame processing"""
+    await websocket.accept()
     
-    stream_id = str(uuid.uuid4())
+    # Store connection info
+    active_websockets[stream_id] = {
+        "websocket": websocket,
+        "config": StreamConfig(),
+        "stats": {
+            "frames_processed": 0,
+            "total_detections": 0,
+            "total_processing_time": 0,
+            "start_time": time.time()
+        },
+        "created_at": time.time()
+    }
+    
+    logger.info(f"WebSocket connected for stream {stream_id}")
     
     try:
-        # Test if camera/video source is accessible
-        cap = cv2.VideoCapture(config.camera_index)
-        if not cap.isOpened():
-            cap.release()
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Cannot open camera/video source: {config.camera_index}"
-            )
-        
-        # Get stream info
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        cap.release()
-        
-        # Store stream configuration
-        active_streams[stream_id] = {
-            "config": config,
-            "status": "initialized",
-            "stream_info": {
-                "width": width,
-                "height": height,
-                "fps": fps
-            },
-            "created_at": time.time(),
-            "last_detection": None
-        }
-        
-        return {
-            "success": True,
+        # Send connection confirmation
+        await websocket.send_json({
+            "type": "connection_established",
             "stream_id": stream_id,
-            "message": "Stream initialized successfully",
-            "stream_info": active_streams[stream_id]["stream_info"]
-        }
+            "message": "Ready to receive frames for processing"
+        })
         
+        # Process incoming frames
+        while True:
+            try:
+                # Receive frame data from frontend
+                message = await websocket.receive_json()
+                
+                if message.get("type") == "frame":
+                    # Process the frame
+                    await process_stream_frame(stream_id, message)
+                    
+                elif message.get("type") == "config_update":
+                    # Update stream configuration
+                    config_data = message.get("config", {})
+                    active_websockets[stream_id]["config"] = StreamConfig(**config_data)
+                    
+                    await websocket.send_json({
+                        "type": "config_updated",
+                        "message": "Configuration updated successfully"
+                    })
+                    
+                elif message.get("type") == "ping":
+                    # Respond to ping
+                    await websocket.send_json({
+                        "type": "pong",
+                        "timestamp": time.time()
+                    })
+                    
+                elif message.get("type") == "stop_stream":
+                    # Stop processing
+                    break
+                    
+                else:
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": f"Unknown message type: {message.get('type')}"
+                    })
+                    
+            except Exception as e:
+                logger.error(f"Error processing message for stream {stream_id}: {e}")
+                await websocket.send_json({
+                    "type": "error",
+                    "message": f"Processing error: {str(e)}"
+                })
+        
+    except WebSocketDisconnect:
+        logger.info(f"WebSocket disconnected for stream {stream_id}")
     except Exception as e:
-        logger.error(f"Error starting stream: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to start stream: {str(e)}")
+        logger.error(f"Error in WebSocket stream {stream_id}: {e}")
+    finally:
+        # Clean up
+        if stream_id in active_websockets:
+            del active_websockets[stream_id]
+        logger.info(f"Cleaned up stream {stream_id}")
 
-@app.get("/stream/{stream_id}/detect")
-async def detect_from_stream(stream_id: str):
-    """Get latest detection results from active stream"""
-    
-    if stream_id not in active_streams:
-        raise HTTPException(status_code=404, detail="Stream not found")
-    
-    stream_data = active_streams[stream_id]
-    config = stream_data["config"]
-    
+async def process_stream_frame(stream_id: str, message: Dict):
+    """Process a single frame from the stream"""
     try:
-        cap = cv2.VideoCapture(config.camera_index)
-        if not cap.isOpened():
-            raise HTTPException(status_code=400, detail="Cannot access video source")
+        if stream_id not in active_websockets:
+            return
         
-        ret, frame = cap.read()
-        cap.release()
+        websocket_info = active_websockets[stream_id]
+        websocket = websocket_info["websocket"]
+        config = websocket_info["config"]
+        stats = websocket_info["stats"]
         
-        if not ret:
-            raise HTTPException(status_code=400, detail="Failed to capture frame")
+        # Extract frame data
+        frame_data = message.get("frame", {})
+        base64_image = frame_data.get("image")
+        client_timestamp = frame_data.get("timestamp", time.time())
+        frame_id = frame_data.get("frame_id")
         
-        # Process frame with OCR
+        if not base64_image:
+            await websocket.send_json({
+                "type": "error",
+                "message": "Missing image data in frame"
+            })
+            return
+        
+        # Process the frame
+        start_time = time.time()
+        
+        # Remove data URL prefix if present
+        if base64_image.startswith('data:image'):
+            base64_image = base64_image.split(',')[1]
+        
+        # Decode and process image
+        image_bytes = base64.b64decode(base64_image)
+        pil_image = Image.open(io.BytesIO(image_bytes))
+        if pil_image.mode != 'RGB':
+            pil_image = pil_image.convert('RGB')
+        
+        opencv_image = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+        
+        # Run OCR detection
         detections, processing_time = ocr_processor.process_image(
-            frame, config.conf_threshold
+            opencv_image, config.conf_threshold
         )
         
-        # Update stream data
-        detection_result = {
-            "detections": detections,
+        # Update stats
+        stats["frames_processed"] += 1
+        stats["total_detections"] += len(detections)
+        stats["total_processing_time"] += processing_time
+        
+        # Send results back to frontend
+        result = {
+            "type": "detection_result",
+            "stream_id": stream_id,
+            "frame_id": frame_id,
+            "client_timestamp": client_timestamp,
+            "server_timestamp": time.time(),
             "processing_time": processing_time,
-            "timestamp": time.time(),
+            "detections": detections,
             "frame_info": {
-                "height": frame.shape[0],
-                "width": frame.shape[1]
+                "width": opencv_image.shape[1],
+                "height": opencv_image.shape[0]
+            },
+            "stats": {
+                "frames_processed": stats["frames_processed"],
+                "total_detections": stats["total_detections"],
+                "avg_processing_time": stats["total_processing_time"] / stats["frames_processed"],
+                "stream_duration": time.time() - stats["start_time"]
             }
         }
         
-        active_streams[stream_id]["last_detection"] = detection_result
-        active_streams[stream_id]["status"] = "active"
-        
-        return {
-            "success": True,
-            "stream_id": stream_id,
-            **detection_result
-        }
+        await websocket.send_json(result)
         
     except Exception as e:
-        logger.error(f"Error detecting from stream {stream_id}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Detection error: {str(e)}")
+        logger.error(f"Error processing frame for stream {stream_id}: {e}")
+        if stream_id in active_websockets:
+            websocket = active_websockets[stream_id]["websocket"]
+            await websocket.send_json({
+                "type": "error",
+                "message": f"Frame processing error: {str(e)}"
+            })
 
-@app.get("/stream/{stream_id}/status")
-async def get_stream_status(stream_id: str):
-    """Get status of a specific stream"""
+@app.get("/streams")
+async def list_active_streams():
+    """List all active WebSocket streams"""
     
-    if stream_id not in active_streams:
-        raise HTTPException(status_code=404, detail="Stream not found")
-    
-    stream_data = active_streams[stream_id]
+    streams_info = []
+    for stream_id, stream_data in active_websockets.items():
+        stats = stream_data["stats"]
+        streams_info.append({
+            "stream_id": stream_id,
+            "created_at": stream_data["created_at"],
+            "config": stream_data["config"].dict(),
+            "stats": {
+                "frames_processed": stats["frames_processed"],
+                "total_detections": stats["total_detections"],
+                "avg_processing_time": stats["total_processing_time"] / max(stats["frames_processed"], 1),
+                "stream_duration": time.time() - stats["start_time"]
+            }
+        })
     
     return {
-        "stream_id": stream_id,
-        "status": stream_data["status"],
-        "config": stream_data["config"],
-        "stream_info": stream_data["stream_info"],
-        "created_at": stream_data["created_at"],
-        "has_recent_detection": stream_data["last_detection"] is not None,
-        "last_detection_time": (
-            stream_data["last_detection"]["timestamp"] 
-            if stream_data["last_detection"] else None
-        )
+        "active_streams": len(active_websockets),
+        "streams": streams_info
     }
 
 @app.delete("/stream/{stream_id}")
 async def stop_stream(stream_id: str):
     """Stop and remove a stream"""
     
-    if stream_id not in active_streams:
+    if stream_id not in active_websockets:
         raise HTTPException(status_code=404, detail="Stream not found")
     
-    del active_streams[stream_id]
+    # Send stop message and clean up
+    websocket_info = active_websockets[stream_id]
+    try:
+        await websocket_info["websocket"].send_json({
+            "type": "stream_stopped",
+            "message": "Stream stopped by server"
+        })
+        await websocket_info["websocket"].close()
+    except:
+        pass
+    
+    del active_websockets[stream_id]
     
     return {
         "success": True,
         "message": f"Stream {stream_id} stopped and removed"
-    }
-
-@app.get("/streams")
-async def list_active_streams():
-    """List all active streams"""
-    
-    streams_info = []
-    for stream_id, stream_data in active_streams.items():
-        streams_info.append({
-            "stream_id": stream_id,
-            "status": stream_data["status"],
-            "created_at": stream_data["created_at"],
-            "config": stream_data["config"],
-            "has_recent_detection": stream_data["last_detection"] is not None
-        })
-    
-    return {
-        "active_streams": len(active_streams),
-        "streams": streams_info
     }
 
 @app.post("/ocr/config")
@@ -412,7 +473,7 @@ async def update_ocr_config(lang: str = "en", use_gpu: bool = False):
     global ocr_processor
     
     try:
-        ocr_processor = OCRProcessor(lang=lang)
+        ocr_processor = OCRProcessor(lang=lang, use_gpu=use_gpu)
         
         return {
             "success": True,
