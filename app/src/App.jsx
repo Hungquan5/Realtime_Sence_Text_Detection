@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { Camera, Upload, Download, Settings, Square, Play, Pause, RotateCcw, FileImage, Sparkles, Target, TrendingUp, Wifi, WifiOff, Activity } from 'lucide-react';
+import { Camera, Upload, Download, Settings, Square, Play, Pause, RotateCcw, FileImage, Sparkles, Target, TrendingUp, Wifi, WifiOff, Activity, Image as ImageIcon } from 'lucide-react';
 
 const TextDetectionApp = () => {
   // State management
@@ -7,6 +7,7 @@ const TextDetectionApp = () => {
   const [isStreaming, setIsStreaming] = useState(false);
   const [isRealTimeActive, setIsRealTimeActive] = useState(false);
   const [capturedImage, setCapturedImage] = useState(null);
+  const [processedImageWithBoxes, setProcessedImageWithBoxes] = useState(null);
   const [detectedText, setDetectedText] = useState([]);
   const [realtimeDetections, setRealtimeDetections] = useState([]);
   const [isProcessing, setIsProcessing] = useState(false);
@@ -32,6 +33,7 @@ const TextDetectionApp = () => {
   const websocketRef = useRef(null);
   const frameIntervalRef = useRef(null);
   const statsIntervalRef = useRef(null);
+  const drawingCanvasRef = useRef(null);
 
   // Stream configuration
   const [streamConfig, setStreamConfig] = useState({
@@ -41,6 +43,75 @@ const TextDetectionApp = () => {
     frame_interval: 500, // milliseconds between frames sent to backend
     max_fps: 30
   });
+
+  // Function to draw bounding boxes on image
+  const drawBoundingBoxesOnImage = useCallback((imageData, detections) => {
+    return new Promise((resolve) => {
+      const img = new Image();
+      img.onload = () => {
+        const canvas = drawingCanvasRef.current;
+        if (!canvas) {
+          resolve(imageData);
+          return;
+        }
+        
+        const ctx = canvas.getContext('2d');
+        canvas.width = img.width;
+        canvas.height = img.height;
+        
+        // Draw the original image
+        ctx.drawImage(img, 0, 0);
+        
+        // Draw bounding boxes if enabled
+        if (showBoundingBoxes && detections.length > 0) {
+          detections.forEach((detection) => {
+            const bbox = detection.bbox;
+            
+            // Set line style
+            ctx.strokeStyle = '#00bcd4'; // Cyan color
+            ctx.lineWidth = Math.max(2, Math.min(img.width, img.height) * 0.003); // Responsive line width
+            ctx.fillStyle = 'rgba(0, 188, 212, 0.1)'; // Semi-transparent cyan fill
+            
+            // Draw filled rectangle
+            ctx.fillRect(bbox.x, bbox.y, bbox.width, bbox.height);
+            
+            // Draw border
+            ctx.strokeRect(bbox.x, bbox.y, bbox.width, bbox.height);
+            
+            // Draw text label
+            const text = `${detection.text} (${Math.round(detection.confidence * 100)}%)`;
+            const fontSize = Math.max(12, Math.min(img.width, img.height) * 0.02);
+            ctx.font = `bold ${fontSize}px Arial`;
+            ctx.fillStyle = '#00bcd4';
+            
+            // Calculate text background
+            const textMetrics = ctx.measureText(text);
+            const textWidth = textMetrics.width;
+            const textHeight = fontSize;
+            const padding = 4;
+            
+            // Draw text background
+            ctx.fillStyle = 'rgba(0, 0, 0, 0.8)';
+            ctx.fillRect(
+              bbox.x, 
+              bbox.y - textHeight - padding * 2, 
+              textWidth + padding * 2, 
+              textHeight + padding * 2
+            );
+            
+            // Draw text
+            ctx.fillStyle = '#ffffff';
+            ctx.fillText(text, bbox.x + padding, bbox.y - padding);
+          });
+        }
+        
+        // Convert canvas to data URL
+        const processedImageData = canvas.toDataURL('image/jpeg', 0.9);
+        resolve(processedImageData);
+      };
+      img.src = imageData;
+    });
+  }, [showBoundingBoxes]);
 
   // Single image detection
   const detectText = useCallback(async (imageData) => {
@@ -96,13 +167,19 @@ const TextDetectionApp = () => {
       }
       
       setDetectedText(processedDetections);
+      
+      // Draw bounding boxes on image
+      const imageWithBoxes = await drawBoundingBoxesOnImage(imageData, processedDetections);
+      setProcessedImageWithBoxes(imageWithBoxes);
+      
     } catch (error) {
       console.error('Error detecting text:', error);
       setDetectedText([]);
+      setProcessedImageWithBoxes(null);
     } finally {
       setIsProcessing(false);
     }
-  }, []);
+  }, [drawBoundingBoxesOnImage]);
 
   // WebSocket management for real-time streaming
   const connectWebSocket = useCallback(() => {
@@ -452,8 +529,19 @@ const TextDetectionApp = () => {
     URL.revokeObjectURL(url);
   };
 
+  const downloadImage = () => {
+    const imageToDownload = processedImageWithBoxes || capturedImage;
+    if (!imageToDownload) return;
+    
+    const link = document.createElement('a');
+    link.href = imageToDownload;
+    link.download = `text-detection-image-${Date.now()}.jpg`;
+    link.click();
+  };
+
   const resetDetection = () => {
     setCapturedImage(null);
+    setProcessedImageWithBoxes(null);
     setDetectedText([]);
     setRealtimeDetections([]);
     setIsProcessing(false);
@@ -488,6 +576,13 @@ const TextDetectionApp = () => {
       startFrameCapture();
     }
   };
+
+  // Update processed image when showBoundingBoxes changes
+  useEffect(() => {
+    if (capturedImage && detectedText.length > 0) {
+      drawBoundingBoxesOnImage(capturedImage, detectedText).then(setProcessedImageWithBoxes);
+    }
+  }, [showBoundingBoxes, capturedImage, detectedText, drawBoundingBoxesOnImage]);
 
   // Cleanup on unmount
   useEffect(() => {
@@ -647,7 +742,7 @@ const TextDetectionApp = () => {
                             return (
                               <div
                                 key={detection.id}
-                                className="absolute border-2 border-cyan-400 bg-cyan-400/10 backdrop-blur-sm rounded-lg"
+                                className="absolute border-2 border-cyan-400 bg-cyan-400/10 rounded-lg"
                                 style={{
                                   left: `${(detection.bbox.x * scaleX / videoRect.width) * 100}%`,
                                   top: `${(detection.bbox.y * scaleY / videoRect.height) * 100}%`,
@@ -803,12 +898,22 @@ const TextDetectionApp = () => {
                         onClick={downloadResults}
                         disabled={currentDetections.length === 0}
                         className="group relative p-2 sm:p-3 bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 rounded-xl transition-all duration-300 disabled:opacity-50 border border-emerald-500/30"
+                        title="Download text results"
                       >
                         <Download className="w-4 h-4 sm:w-5 sm:h-5" />
                       </button>
                       <button
+                        onClick={downloadImage}
+                        disabled={!processedImageWithBoxes && !capturedImage}
+                        className="group relative p-2 sm:p-3 bg-blue-500/20 hover:bg-blue-500/30 text-blue-300 rounded-xl transition-all duration-300 disabled:opacity-50 border border-blue-500/30"
+                        title="Download image with bounding boxes"
+                      >
+                        <ImageIcon className="w-4 h-4 sm:w-5 sm:h-5" />
+                      </button>
+                      <button
                         onClick={resetDetection}
                         className="group relative p-2 sm:p-3 bg-gray-500/20 hover:bg-gray-500/30 text-gray-300 rounded-xl transition-all duration-300 border border-gray-500/30"
+                        title="Reset detection"
                       >
                         <RotateCcw className="w-4 h-4 sm:w-5 sm:h-5" />
                       </button>
@@ -819,8 +924,8 @@ const TextDetectionApp = () => {
                     <div className="relative">
                       <img
                         ref={imageRef}
-                        src={capturedImage}
-                        alt="Captured"
+                        src={processedImageWithBoxes || capturedImage}
+                        alt="Captured with detections"
                         className="w-full h-auto rounded-xl sm:rounded-2xl shadow-2xl border border-white/20"
                         onLoad={handleImageLoad}
                       />
@@ -839,32 +944,6 @@ const TextDetectionApp = () => {
                           </div>
                         </div>
                       )}
-                      
-                      {showBoundingBoxes && detectedText.map((text, index) => {
-                        const bboxToUse = text.bboxPercent || 
-                          (imageNaturalSize.width && imageNaturalSize.height ? 
-                            convertToPercentage(text.bbox, imageNaturalSize.width, imageNaturalSize.height) : 
-                            null);
-                        
-                        if (!bboxToUse) return null;
-                        
-                        return (
-                          <div
-                            key={text.id || index}
-                            className="absolute border-2 border-cyan-400 bg-cyan-400/10 backdrop-blur-sm rounded-lg"
-                            style={{
-                              left: `${bboxToUse.x}%`,
-                              top: `${bboxToUse.y}%`,
-                              width: `${bboxToUse.width}%`,
-                              height: `${bboxToUse.height}%`,
-                            }}
-                          >
-                            <div className="absolute -top-6 sm:-top-8 left-0 bg-gradient-to-r from-cyan-500 to-purple-600 text-white text-xs px-2 sm:px-3 py-1 rounded-lg whitespace-nowrap font-semibold shadow-2xl max-w-xs truncate">
-                              {text.text} ({Math.round(text.confidence * 100)}%)
-                            </div>
-                          </div>
-                        );
-                      })}
                     </div>
                   )}
                   
@@ -931,7 +1010,14 @@ const TextDetectionApp = () => {
                         </span>
                         <span className="text-xs text-gray-400">High</span>
                       </div>
-                      <div className="relative">
+                      <div className="relative h-3 w-full">
+                        {/* Background track (progress bar) */}
+                        <div 
+                          className="absolute top-0 left-0 h-3 bg-gradient-to-r from-cyan-500 to-purple-600 rounded-lg pointer-events-none z-0"
+                          style={{ width: `${confidence * 100}%` }}
+                        ></div>
+                      
+                        {/* Invisible input range slider overlaid on top */}
                         <input
                           type="range"
                           min="0"
@@ -943,12 +1029,9 @@ const TextDetectionApp = () => {
                             setConfidence(newValue);
                             updateStreamConfig('conf_threshold', newValue);
                           }}
-                          className="w-full h-3 bg-gradient-to-r from-gray-700 to-gray-600 rounded-lg appearance-none cursor-pointer slider"
+                          className="absolute top-0 left-0 w-full h-3 appearance-none z-10 cursor-pointer"
+                          style={{ background: 'transparent' }}
                         />
-                        <div 
-                          className="absolute top-0 left-0 h-3 bg-gradient-to-r from-cyan-500 to-purple-600 rounded-lg pointer-events-none"
-                          style={{ width: `${confidence * 100}%` }}
-                        ></div>
                       </div>
                     </div>
                   </div>
@@ -1163,6 +1246,7 @@ const TextDetectionApp = () => {
       </div>
 
       <canvas ref={canvasRef} className="hidden" />
+      <canvas ref={drawingCanvasRef} className="hidden" />
     </div>
   );
 };
