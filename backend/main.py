@@ -76,7 +76,627 @@ class StreamConfig(BaseModel):
     use_angle_cls: bool = False  # Disable angle classification
     det_db_thresh: float = 0.3  # Detection threshold
     det_db_box_thresh: float = 0.6  # Box threshold
+# Add these imports at the top of your existing file
+import os
+from typing import Union
+import google.generativeai as genai
+from dataclasses import dataclass
+import re
+import json as json_module
 
+# Add these new classes after your existing models
+class LLMConfig(BaseModel):
+    enabled: bool = True
+    api_key: Optional[str] = None
+    model_name: str = "gemini-1.5-flash"
+    temperature: float = 0.1
+    max_tokens: int = 1000
+    correction_prompt_type: str = "general"  # general, structured, numbers, etc.
+
+class EnhancedTextDetectionResponse(BaseModel):
+    success: bool
+    message: str
+    detections: List[Dict[str, Any]]
+    processing_time: float
+    image_info: Optional[Dict[str, Any]] = None
+    llm_corrections: Optional[Dict[str, Any]] = None
+    total_processing_time: float
+
+@dataclass
+class CorrectionResult:
+    original_text: str
+    corrected_text: str
+    confidence_score: float
+    correction_applied: bool
+    correction_reason: str
+
+class GeminiLLMProcessor:
+    """Enhanced LLM processor using Google's Gemini API for OCR post-processing"""
+    
+    def __init__(self, config: LLMConfig):
+        self.config = config
+        self.api_key = config.api_key or os.getenv('GOOGLE_API_KEY')
+        
+        if not self.api_key:
+            raise ValueError("Google API key not found. Set GOOGLE_API_KEY environment variable or pass api_key in config")
+        
+        # Configure Gemini
+        genai.configure(api_key=self.api_key)
+        self.model = genai.GenerativeModel(config.model_name)
+        
+        # Predefined correction prompts for different contexts
+        self.correction_prompts = {
+            "general": """
+You are an OCR correction expert. Analyze the following OCR-detected text and provide corrections for any obvious errors.
+
+Rules:
+1. Fix spelling mistakes and typos
+2. Correct obvious character recognition errors (e.g., '0' vs 'O', '1' vs 'l', '5' vs 'S')
+3. Improve capitalization and punctuation
+4. Maintain the original meaning and context
+5. Don't add new information not present in the original
+6. If text appears to be a specific format (phone numbers, emails, addresses), correct accordingly
+
+Original OCR Text: "{text}"
+
+Respond in this exact JSON format:
+{{
+    "corrected_text": "corrected version here",
+    "confidence_score": 0.95,
+    "corrections_made": ["list of specific corrections"],
+    "reasoning": "brief explanation of corrections"
+}}
+""",
+            
+            "structured": """
+You are an OCR correction expert specializing in structured data (forms, tables, documents).
+
+Analyze this OCR text and correct errors while preserving structure:
+
+Rules:
+1. Fix character recognition errors common in forms
+2. Correct number/letter confusion (0/O, 1/l/I, 5/S, etc.)
+3. Fix spacing issues in structured data
+4. Correct obvious field labels and values
+5. Maintain original formatting structure
+6. Fix date formats and number formats
+
+Original OCR Text: "{text}"
+
+Respond in JSON format:
+{{
+    "corrected_text": "corrected version",
+    "confidence_score": 0.90,
+    "corrections_made": ["specific corrections"],
+    "reasoning": "explanation",
+    "detected_format": "form/table/document/other"
+}}
+""",
+            
+            "numbers": """
+You are an OCR correction expert specializing in numerical data.
+
+Correct this OCR text focusing on numbers, dates, and numerical patterns:
+
+Rules:
+1. Fix digit recognition errors (0/O, 1/l, 5/S, 6/G, 8/B, etc.)
+2. Correct phone numbers, IDs, codes, prices
+3. Fix date and time formats
+4. Correct mathematical expressions or measurements
+5. Fix decimal points and thousands separators
+
+Original OCR Text: "{text}"
+
+JSON Response:
+{{
+    "corrected_text": "corrected version",
+    "confidence_score": 0.92,
+    "corrections_made": ["corrections list"],
+    "reasoning": "explanation",
+    "number_corrections": ["specific number fixes"]
+}}
+""",
+            
+            "contextual": """
+You are an OCR correction expert with contextual understanding.
+
+Analyze this text considering its likely context and correct errors:
+
+Rules:
+1. Consider the context and likely content type
+2. Fix errors based on common word patterns
+3. Correct grammar and sentence structure
+4. Fix punctuation and capitalization
+5. Resolve ambiguous characters using context
+6. Maintain original intent and meaning
+
+Original OCR Text: "{text}"
+Context Hint: Look for common document types, signs, labels, or text patterns.
+
+JSON Response:
+{{
+    "corrected_text": "corrected version",
+    "confidence_score": 0.88,
+    "corrections_made": ["corrections"],
+    "reasoning": "explanation",
+    "detected_context": "likely content type"
+}}
+"""
+        }
+    
+    async def correct_text_batch(self, detections: List[Dict], prompt_type: str = "general") -> Dict[str, Any]:
+        """Process multiple text detections with LLM corrections"""
+        if not self.config.enabled or not detections:
+            return {
+                "enabled": False,
+                "total_corrections": 0,
+                "corrected_detections": detections,
+                "processing_time": 0,
+                "model_used": None
+            }
+        
+        start_time = time.time()
+        corrected_detections = []
+        total_corrections = 0
+        correction_details = []
+        
+        try:
+            # Process texts in batches for efficiency
+            batch_size = 5  # Process 5 texts at once
+            
+            for i in range(0, len(detections), batch_size):
+                batch = detections[i:i + batch_size]
+                batch_results = await self._process_batch(batch, prompt_type)
+                
+                corrected_detections.extend(batch_results["detections"])
+                total_corrections += batch_results["corrections_count"]
+                correction_details.extend(batch_results["details"])
+                
+                # Small delay to respect API limits
+                if i + batch_size < len(detections):
+                    await asyncio.sleep(0.1)
+        
+        except Exception as e:
+            logger.error(f"LLM correction failed: {str(e)}")
+            # Return original detections if LLM fails
+            corrected_detections = detections
+            correction_details = [{"error": str(e)}]
+        
+        processing_time = time.time() - start_time
+        
+        return {
+            "enabled": True,
+            "total_corrections": total_corrections,
+            "corrected_detections": corrected_detections,
+            "processing_time": processing_time,
+            "model_used": self.config.model_name,
+            "correction_details": correction_details,
+            "prompt_type": prompt_type
+        }
+    
+    async def _process_batch(self, batch: List[Dict], prompt_type: str) -> Dict:
+        """Process a batch of detections"""
+        corrections_count = 0
+        corrected_batch = []
+        details = []
+        
+        # Combine texts for batch processing
+        texts_to_process = [detection["text"] for detection in batch]
+        
+        # Create batch prompt
+        if len(texts_to_process) == 1:
+            prompt = self.correction_prompts[prompt_type].format(text=texts_to_process[0])
+        else:
+            # Multi-text batch prompt
+            text_list = "\n".join([f"{i+1}. {text}" for i, text in enumerate(texts_to_process)])
+            prompt = f"""
+You are an OCR correction expert. Correct the following {len(texts_to_process)} OCR-detected texts:
+
+{text_list}
+
+Respond with a JSON array containing corrections for each text:
+[
+    {{
+        "index": 1,
+        "corrected_text": "corrected version",
+        "confidence_score": 0.95,
+        "corrections_made": ["corrections"],
+        "reasoning": "explanation"
+    }},
+    ...
+]
+"""
+        
+        try:
+            # Make API call to Gemini
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                THREAD_POOL,
+                self._call_gemini_api,
+                prompt
+            )
+            
+            # Parse response
+            if len(texts_to_process) == 1:
+                corrections = [self._parse_single_response(response)]
+            else:
+                corrections = self._parse_batch_response(response, len(texts_to_process))
+            
+            # Apply corrections to detections
+            for i, detection in enumerate(batch):
+                original_text = detection["text"]
+                
+                if i < len(corrections) and corrections[i]:
+                    correction = corrections[i]
+                    corrected_text = correction.get("corrected_text", original_text)
+                    
+                    # Update detection with corrected text
+                    corrected_detection = detection.copy()
+                    corrected_detection["text"] = corrected_text
+                    corrected_detection["original_text"] = original_text
+                    corrected_detection["llm_correction"] = {
+                        "applied": corrected_text != original_text,
+                        "confidence": correction.get("confidence_score", 0.0),
+                        "corrections_made": correction.get("corrections_made", []),
+                        "reasoning": correction.get("reasoning", "")
+                    }
+                    
+                    if corrected_text != original_text:
+                        corrections_count += 1
+                    
+                    corrected_batch.append(corrected_detection)
+                    details.append({
+                        "original": original_text,
+                        "corrected": corrected_text,
+                        "changed": corrected_text != original_text
+                    })
+                else:
+                    # No correction available
+                    detection["llm_correction"] = {
+                        "applied": False,
+                        "confidence": 0.0,
+                        "error": "Failed to process"
+                    }
+                    corrected_batch.append(detection)
+                    details.append({
+                        "original": original_text,
+                        "corrected": original_text,
+                        "changed": False,
+                        "error": "Processing failed"
+                    })
+        
+        except Exception as e:
+            logger.error(f"Batch processing failed: {str(e)}")
+            # Return original detections with error info
+            for detection in batch:
+                detection["llm_correction"] = {
+                    "applied": False,
+                    "error": str(e)
+                }
+                corrected_batch.append(detection)
+                details.append({
+                    "original": detection["text"],
+                    "corrected": detection["text"],
+                    "changed": False,
+                    "error": str(e)
+                })
+        
+        return {
+            "detections": corrected_batch,
+            "corrections_count": corrections_count,
+            "details": details
+        }
+    
+    def _call_gemini_api(self, prompt: str) -> str:
+        """Call Gemini API synchronously"""
+        try:
+            response = self.model.generate_content(
+                prompt,
+                generation_config=genai.types.GenerationConfig(
+                    temperature=self.config.temperature,
+                    max_output_tokens=self.config.max_tokens,
+                )
+            )
+            return response.text
+        except Exception as e:
+            logger.error(f"Gemini API call failed: {str(e)}")
+            raise
+    
+    def _parse_single_response(self, response: str) -> Dict:
+        """Parse single correction response"""
+        try:
+            # Extract JSON from response
+            json_match = re.search(r'\{.*\}', response, re.DOTALL)
+            if json_match:
+                return json_module.loads(json_match.group())
+            else:
+                # Fallback parsing
+                return {"corrected_text": response.strip(), "confidence_score": 0.5}
+        except Exception as e:
+            logger.error(f"Failed to parse single response: {str(e)}")
+            return {}
+    
+    def _parse_batch_response(self, response: str, expected_count: int) -> List[Dict]:
+        """Parse batch correction response"""
+        try:
+            # Extract JSON array from response
+            json_match = re.search(r'\[.*\]', response, re.DOTALL)
+            if json_match:
+                corrections = json_module.loads(json_match.group())
+                return corrections[:expected_count]  # Ensure we don't have extra results
+            else:
+                return []
+        except Exception as e:
+            logger.error(f"Failed to parse batch response: {str(e)}")
+            return []
+
+# Initialize LLM processor (add this after ocr_processor initialization)
+llm_config = LLMConfig(
+    enabled=bool(os.getenv('GOOGLE_API_KEY')),  # Only enable if API key is available
+    api_key=os.getenv('GOOGLE_API_KEY'),
+    model_name="gemini-1.5-flash",
+    temperature=0.1
+)
+
+try:
+    llm_processor = GeminiLLMProcessor(llm_config) if llm_config.enabled else None
+except Exception as e:
+    logger.warning(f"LLM processor initialization failed: {str(e)}")
+    llm_processor = None
+
+# Enhanced endpoint for image detection with LLM correction
+@app.post("/detect/image/enhanced", response_model=EnhancedTextDetectionResponse)
+async def detect_text_from_image_enhanced(
+    file: UploadFile = File(...),
+    conf_threshold: float = 0.5,
+    lang: str = "en",
+    enable_llm_correction: bool = True,
+    correction_type: str = "general"  # general, structured, numbers, contextual
+):
+    """Enhanced text detection with LLM post-processing"""
+    
+    if not file.content_type.startswith('image/'):
+        raise HTTPException(status_code=400, detail="File must be an image")
+    
+    total_start_time = time.time()
+    
+    try:
+        # Read uploaded file
+        contents = await file.read()
+        
+        # Process with OCR
+        loop = asyncio.get_event_loop()
+        opencv_image = await loop.run_in_executor(
+            THREAD_POOL,
+            lambda: decode_and_convert_image(base64.b64encode(contents).decode())
+        )
+        
+        # OCR Processing
+        detections, ocr_processing_time = await process_image_async(
+            opencv_image, conf_threshold
+        )
+        
+        # LLM Post-processing
+        llm_corrections = None
+        if enable_llm_correction and llm_processor and detections:
+            try:
+                llm_corrections = await llm_processor.correct_text_batch(
+                    detections, correction_type
+                )
+                # Use corrected detections if available
+                if llm_corrections.get("corrected_detections"):
+                    detections = llm_corrections["corrected_detections"]
+            except Exception as e:
+                logger.error(f"LLM correction failed: {str(e)}")
+                llm_corrections = {
+                    "enabled": False,
+                    "error": str(e),
+                    "processing_time": 0
+                }
+        
+        # Get image info
+        height, width = opencv_image.shape[:2]
+        image_info = {
+            "width": width,
+            "height": height,
+            "filename": file.filename,
+            "size_bytes": len(contents),
+            "processed_size": f"{opencv_image.shape[1]}x{opencv_image.shape[0]}"
+        }
+        
+        total_processing_time = time.time() - total_start_time
+        
+        return EnhancedTextDetectionResponse(
+            success=True,
+            message=f"Successfully detected {len(detections)} text regions with LLM enhancement",
+            detections=detections,
+            processing_time=ocr_processing_time,
+            image_info=image_info,
+            llm_corrections=llm_corrections,
+            total_processing_time=total_processing_time
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in enhanced detection: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
+
+# Enhanced endpoint for base64 detection with LLM correction
+@app.post("/detect/base64/enhanced", response_model=EnhancedTextDetectionResponse)
+async def detect_text_from_base64_enhanced(
+    image_data: Dict[str, Any],
+    conf_threshold: float = 0.5,
+    enable_llm_correction: bool = True,
+    correction_type: str = "general"
+):
+    """Enhanced base64 text detection with LLM post-processing"""
+    
+    total_start_time = time.time()
+    
+    try:
+        if 'image' not in image_data:
+            raise HTTPException(status_code=400, detail="Missing 'image' field in request")
+        
+        base64_string = image_data['image']
+        
+        # OCR Processing
+        loop = asyncio.get_event_loop()
+        opencv_image = await loop.run_in_executor(
+            THREAD_POOL,
+            decode_and_convert_image,
+            base64_string
+        )
+        
+        detections, ocr_processing_time = await process_image_async(
+            opencv_image, conf_threshold
+        )
+        
+        # LLM Post-processing
+        llm_corrections = None
+        if enable_llm_correction and llm_processor and detections:
+            try:
+                llm_corrections = await llm_processor.correct_text_batch(
+                    detections, correction_type
+                )
+                if llm_corrections.get("corrected_detections"):
+                    detections = llm_corrections["corrected_detections"]
+            except Exception as e:
+                logger.error(f"LLM correction failed: {str(e)}")
+                llm_corrections = {
+                    "enabled": False,
+                    "error": str(e),
+                    "processing_time": 0
+                }
+        
+        # Get image info
+        height, width = opencv_image.shape[:2]
+        image_info = {
+            "width": width,
+            "height": height,
+            "processed_size": f"{opencv_image.shape[1]}x{opencv_image.shape[0]}",
+            "size_bytes": len(base64.b64decode(base64_string.split(',')[1] if 'data:image' in base64_string else base64_string))
+        }
+        
+        total_processing_time = time.time() - total_start_time
+        
+        return EnhancedTextDetectionResponse(
+            success=True,
+            message=f"Successfully detected {len(detections)} text regions with LLM enhancement",
+            detections=detections,
+            processing_time=ocr_processing_time,
+            image_info=image_info,
+            llm_corrections=llm_corrections,
+            total_processing_time=total_processing_time
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in enhanced base64 detection: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
+
+# Configuration endpoint for LLM settings
+@app.post("/llm/config")
+async def update_llm_config(
+    enabled: bool = True,
+    api_key: Optional[str] = None,
+    model_name: str = "gemini-1.5-flash",
+    temperature: float = 0.1,
+    max_tokens: int = 1000
+):
+    """Update LLM configuration"""
+    
+    global llm_processor, llm_config
+    
+    try:
+        # Update config
+        llm_config = LLMConfig(
+            enabled=enabled,
+            api_key=api_key or os.getenv('GOOGLE_API_KEY'),
+            model_name=model_name,
+            temperature=temperature,
+            max_tokens=max_tokens
+        )
+        
+        # Reinitialize processor
+        if enabled and llm_config.api_key:
+            llm_processor = GeminiLLMProcessor(llm_config)
+        else:
+            llm_processor = None
+        
+        return {
+            "success": True,
+            "message": "LLM configuration updated",
+            "config": {
+                "enabled": enabled,
+                "model_name": model_name,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "api_key_configured": bool(llm_config.api_key)
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Error updating LLM config: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Configuration error: {str(e)}")
+
+# Test LLM correction endpoint
+@app.post("/llm/test")
+async def test_llm_correction(
+    text: str,
+    correction_type: str = "general"
+):
+    """Test LLM correction on sample text"""
+    
+    if not llm_processor:
+        raise HTTPException(status_code=400, detail="LLM processor not configured")
+    
+    try:
+        # Create fake detection for testing
+        test_detection = [{"text": text, "confidence": 0.9, "box": [[0, 0], [100, 0], [100, 20], [0, 20]]}]
+        
+        result = await llm_processor.correct_text_batch(test_detection, correction_type)
+        
+        return {
+            "success": True,
+            "original_text": text,
+            "correction_result": result,
+            "model_used": llm_config.model_name
+        }
+        
+    except Exception as e:
+        logger.error(f"Error testing LLM correction: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Test error: {str(e)}")
+
+# Enhanced health check with LLM status
+@app.get("/health/enhanced")
+async def enhanced_health_check():
+    """Enhanced health check including LLM status"""
+    return {
+        "status": "healthy",
+        "timestamp": time.time(),
+        "ocr": {
+            "lang": ocr_processor.lang,
+            "gpu_enabled": ocr_processor.use_gpu,
+            "max_image_size": ocr_processor.max_image_size
+        },
+        "llm": {
+            "enabled": llm_processor is not None,
+            "model": llm_config.model_name if llm_config else None,
+            "api_key_configured": bool(llm_config and llm_config.api_key)
+        },
+        "performance": {
+            "max_workers": MAX_WORKERS,
+            "active_websockets": len(active_websockets)
+        }
+    }
+
+# Add this at the end of the file for requirements
+"""
+Additional requirements to add to your requirements.txt:
+
+google-generativeai>=0.3.0
+
+Environment variables to set:
+GOOGLE_API_KEY=your_google_ai_studio_api_key
+"""
 class OptimizedOCRProcessor:
     """Optimized wrapper class for PaddleOCR processing"""
     
@@ -98,7 +718,15 @@ class OptimizedOCRProcessor:
                 'max_text_length': 25  # Limit text length for speed
             })
         
-        self.ocr = PaddleOCR(**ocr_params)
+        self.ocr = PaddleOCR(
+    use_angle_cls=False,
+    enable_hpi=True,
+    # text_orientation_model_path="/media/quannh/DATA/Scene_text_detection_realtime/backend/onnx_models/PP-LCNet_x0_25_textline_ori",
+    # text_line_model_path="/media/quannh/DATA/Scene_text_detection_realtime/backend/onnx_models/PP-LCNet_x1_0_doc_ori",
+    det_model_dir='/media/quannh/DATA/Scene_text_detection_realtime/backend/onnx_models/PP-OCRv5_mobile_det',
+    rec_model_dir='/media/quannh/DATA/Scene_text_detection_realtime/backend/onnx_models/PP-OCRv5_mobile_rec',
+)
+
         self.max_image_size = config.max_image_size if config else 1280
         
         # Cache for frequent operations
