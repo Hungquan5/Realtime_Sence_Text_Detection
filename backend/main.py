@@ -710,6 +710,7 @@ class OptimizedOCRProcessor:
             'lang': lang,
             'det_db_thresh': config.det_db_thresh if config else 0.3,
             'det_db_box_thresh': config.det_db_box_thresh if config else 0.6,
+            'device': 'cpu'
         }
         
         if use_gpu:
@@ -721,10 +722,11 @@ class OptimizedOCRProcessor:
         self.ocr = PaddleOCR(
     use_angle_cls=False,
     enable_hpi=True,
-    # text_orientation_model_path="/media/quannh/DATA/Scene_text_detection_realtime/backend/onnx_models/PP-LCNet_x0_25_textline_ori",
-    # text_line_model_path="/media/quannh/DATA/Scene_text_detection_realtime/backend/onnx_models/PP-LCNet_x1_0_doc_ori",
+    # doc_orientation_classify_model_dir="/media/quannh/DATA/Scene_text_detection_realtime/backend/onnx_models/PP-LCNet_x0_25_textline_ori",
+    # layout_detection_model_dir="/media/quannh/DATA/Scene_text_detection_realtime/backend/onnx_models/PP-LCNet_x1_0_doc_ori",	
     det_model_dir='/media/quannh/DATA/Scene_text_detection_realtime/backend/onnx_models/PP-OCRv5_mobile_det',
     rec_model_dir='/media/quannh/DATA/Scene_text_detection_realtime/backend/onnx_models/PP-OCRv5_mobile_rec',
+    **ocr_params
 )
 
         self.max_image_size = config.max_image_size if config else 1280
